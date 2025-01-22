@@ -955,14 +955,6 @@ impl Program {
                                 state.registers[*dest] = OwnedValue::Null;
                             }
                         }
-                        CursorType::Ephemeral(_) => {
-                            let cursor = ephemeral_cursors.get_mut(cursor_id).unwrap();
-                            if let Some(record) = cursor.record() {
-                                state.registers[*dest] = record.values[*column].clone();
-                            } else {
-                                state.registers[*dest] = OwnedValue::Null
-                            }
-                        }
                     }
 
                     state.pc += 1;

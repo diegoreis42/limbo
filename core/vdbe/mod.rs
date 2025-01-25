@@ -367,7 +367,7 @@ macro_rules! must_be_btree_cursor {
             CursorType::BTreeIndex(_) => get_cursor_as_index_mut(&mut $cursors, $cursor_id),
             CursorType::Pseudo(_) => panic!("{} on pseudo cursor", $insn_name),
             CursorType::Ephemeral(_) => {
-                GeneralCursor::Ephemeral($ephemeral_cursors.get_mut(&$cursor_id).unwrap()) 
+                GeneralCursor::Ephemeral($ephemeral_cursors.get_mut(&$cursor_id).unwrap())
             }
             CursorType::Sorter => panic!("{} on sorter cursor", $insn_name),
         };

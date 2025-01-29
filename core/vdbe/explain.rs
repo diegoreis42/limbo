@@ -1166,15 +1166,6 @@ pub fn insn_to_str(
                 0,
                 String::new(),
             ),
-            Insn::And { lhs, rhs, dest } => (
-                "Or",
-                *rhs as i32,
-                *lhs as i32,
-                *dest as i32,
-                OwnedValue::build_text(Rc::new("".to_string())),
-                0,
-                format!("r[{}]=(r[{}] && r[{}])", dest, lhs, rhs),
-            ),
             Insn::OpenEphemeral {
                 cursor_id,
                 content_reg,

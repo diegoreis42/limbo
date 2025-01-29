@@ -48,6 +48,7 @@ impl Schema {
 pub enum Table {
     BTree(Rc<BTreeTable>),
     Pseudo(Rc<PseudoTable>),
+    #[allow(dead_code)]
     EphemeralTable(Rc<EphemeralTable>),
 }
 

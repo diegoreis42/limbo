@@ -266,6 +266,18 @@ fn get_cursor_as_sorter_mut<'long, 'short>(
     cursor
 }
 
+fn get_cursor_as_ephemeral_mut<'long, 'short>(
+    cursors: &'short mut RefMut<'long, Vec<Option<Cursor>>>,
+    cursor_id: CursorID,
+) -> &'short mut EphemeralCursor {
+    cursors
+        .get_mut(cursor_id)
+        .expect("cursor id out of bounds")
+        .as_mut()
+        .expect("cursor not allocated")
+        .as_ephemeral_mut()
+}
+
 struct Bitfield<const N: usize>([u64; N]);
 
 impl<const N: usize> Bitfield<N> {
@@ -287,6 +299,11 @@ impl<const N: usize> Bitfield<N> {
         assert!(bit < N * 64, "bit out of bounds");
         (self.0[bit / 64] & (1 << (bit % 64))) != 0
     }
+}
+
+pub enum GeneralCursor<'a> {
+    BTree(&'a mut BTreeCursor),
+    Ephemeral(&'a mut EphemeralCursor),
 }
 
 /// The program state describes the environment in which the program executes.
@@ -363,12 +380,16 @@ macro_rules! must_be_btree_cursor {
     ($cursor_id:expr, $cursor_ref:expr, $cursors:expr, $insn_name:expr) => {{
         let (_, cursor_type) = $cursor_ref.get($cursor_id).unwrap();
         let cursor = match cursor_type {
-            CursorType::BTreeTable(_) => get_cursor_as_table_mut(&mut $cursors, $cursor_id),
-            CursorType::BTreeIndex(_) => get_cursor_as_index_mut(&mut $cursors, $cursor_id),
-            CursorType::Pseudo(_) => panic!("{} on pseudo cursor", $insn_name),
-            CursorType::Ephemeral(_) => {
-                GeneralCursor::Ephemeral($ephemeral_cursors.get_mut(&$cursor_id).unwrap())
+            CursorType::BTreeTable(_) => {
+                GeneralCursor::BTree(get_cursor_as_table_mut(&mut $cursors, $cursor_id))
             }
+            CursorType::BTreeIndex(_) => {
+                GeneralCursor::BTree(get_cursor_as_index_mut(&mut $cursors, $cursor_id))
+            }
+            CursorType::Ephemeral(_) => {
+                GeneralCursor::Ephemeral(get_cursor_as_ephemeral_mut(&mut $cursors, $cursor_id))
+            }
+            CursorType::Pseudo(_) => panic!("{} on pseudo cursor", $insn_name),
             CursorType::Sorter => panic!("{} on sorter cursor", $insn_name),
         };
         cursor
@@ -498,9 +519,10 @@ impl Program {
                     state.pc += 1;
                 }
                 Insn::NullRow { cursor_id } => {
-                    let cursor =
-                        must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "NullRow");
-                    cursor.set_null_flag(true);
+                    match must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "NullRow") {
+                        GeneralCursor::BTree(cursor) => cursor.set_null_flag(true),
+                        GeneralCursor::Ephemeral(cursor) => cursor.set_null_flag(true),
+                    }
                     state.pc += 1;
                 }
                 Insn::Compare {
@@ -795,23 +817,26 @@ impl Program {
                     root_page,
                 } => {
                     let (_, cursor_type) = self.cursor_ref.get(*cursor_id).unwrap();
-                    let cursor = BTreeCursor::new(pager.clone(), *root_page);
                     match cursor_type {
                         CursorType::BTreeTable(_) => {
+                            let cursor = BTreeCursor::new(pager.clone(), *root_page);
                             cursors
                                 .get_mut(*cursor_id)
                                 .unwrap()
                                 .replace(Cursor::new_table(cursor));
                         }
                         CursorType::BTreeIndex(_) => {
+                            let cursor = BTreeCursor::new(pager.clone(), *root_page);
                             cursors
                                 .get_mut(*cursor_id)
                                 .unwrap()
                                 .replace(Cursor::new_index(cursor));
                         }
                         CursorType::Ephemeral(_) => {
-                            let cursor = EphemeralCursor::new();
-                            ephemeral_cursors.insert(*cursor_id, cursor);
+                            cursors
+                                .get_mut(*cursor_id)
+                                .unwrap()
+                                .replace(Cursor::new_ephemeral(EphemeralCursor::new()));
                         }
                         CursorType::Pseudo(_) => {
                             panic!("OpenReadAsync on pseudo cursor");
@@ -843,19 +868,26 @@ impl Program {
                     num_fields: _,
                 } => {
                     let cursor = EphemeralCursor::new();
-                    ephemeral_cursors.insert(*cursor_id, cursor);
+                    cursors
+                        .get_mut(*cursor_id)
+                        .unwrap()
+                        .replace(Cursor::new_ephemeral(cursor));
                     state.pc += 1;
                 }
                 Insn::RewindAsync { cursor_id } => {
-                    let cursor =
-                        must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "RewindAsync");
-                    return_if_io!(cursor.rewind());
+                    match must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "RewindAsync")
+                    {
+                        GeneralCursor::BTree(cursor) => return_if_io!(cursor.rewind()),
+                        GeneralCursor::Ephemeral(cursor) => return_if_io!(cursor.rewind()),
+                    }
+
                     state.pc += 1;
                 }
                 Insn::LastAsync { cursor_id } => {
-                    let cursor =
-                        must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "LastAsync");
-                    return_if_io!(cursor.last());
+                    match must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "LastAsync") {
+                        GeneralCursor::BTree(cursor) => return_if_io!(cursor.last()),
+                        GeneralCursor::Ephemeral(cursor) => return_if_io!(cursor.last()),
+                    }
                     state.pc += 1;
                 }
                 Insn::LastAwait {
@@ -863,13 +895,24 @@ impl Program {
                     pc_if_empty,
                 } => {
                     assert!(pc_if_empty.is_offset());
-                    let cursor =
-                        must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "LastAwait");
-                    cursor.wait_for_completion()?;
-                    if cursor.is_empty() {
-                        state.pc = pc_if_empty.to_offset_int();
-                    } else {
-                        state.pc += 1;
+
+                    match must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "LastAwait") {
+                        GeneralCursor::BTree(cursor) => {
+                            cursor.wait_for_completion()?;
+                            if cursor.is_empty() {
+                                state.pc = pc_if_empty.to_offset_int();
+                            } else {
+                                state.pc += 1;
+                            }
+                        }
+                        GeneralCursor::Ephemeral(cursor) => {
+                            cursor.wait_for_completion()?;
+                            if cursor.is_empty() {
+                                state.pc = pc_if_empty.to_offset_int();
+                            } else {
+                                state.pc += 1;
+                            }
+                        }
                     }
                 }
                 Insn::RewindAwait {
@@ -877,13 +920,25 @@ impl Program {
                     pc_if_empty,
                 } => {
                     assert!(pc_if_empty.is_offset());
-                    let cursor =
-                        must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "RewindAwait");
-                    cursor.wait_for_completion()?;
-                    if cursor.is_empty() {
-                        state.pc = pc_if_empty.to_offset_int();
-                    } else {
-                        state.pc += 1;
+
+                    match must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "RewindAwait")
+                    {
+                        GeneralCursor::BTree(cursor) => {
+                            cursor.wait_for_completion()?;
+                            if cursor.is_empty() {
+                                state.pc = pc_if_empty.to_offset_int();
+                            } else {
+                                state.pc += 1;
+                            }
+                        }
+                        GeneralCursor::Ephemeral(cursor) => {
+                            cursor.wait_for_completion()?;
+                            if cursor.is_empty() {
+                                state.pc = pc_if_empty.to_offset_int();
+                            } else {
+                                state.pc += 1;
+                            }
+                        }
                     }
                 }
                 Insn::Column {
@@ -974,17 +1029,31 @@ impl Program {
                     return Ok(StepResult::Row(record));
                 }
                 Insn::NextAsync { cursor_id } => {
-                    let cursor =
-                        must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "NextAsync");
-                    cursor.set_null_flag(false);
-                    return_if_io!(cursor.next());
+                    match must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "NextAsync") {
+                        GeneralCursor::BTree(cursor) => {
+                            cursor.set_null_flag(false);
+                            return_if_io!(cursor.next());
+                        }
+                        GeneralCursor::Ephemeral(cursor) => {
+                            cursor.set_null_flag(false);
+                            return_if_io!(cursor.next());
+                        }
+                    }
+
                     state.pc += 1;
                 }
                 Insn::PrevAsync { cursor_id } => {
-                    let cursor =
-                        must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "PrevAsync");
-                    cursor.set_null_flag(false);
-                    return_if_io!(cursor.prev());
+                    match must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "PrevAsync") {
+                        GeneralCursor::BTree(cursor) => {
+                            cursor.set_null_flag(false);
+                            return_if_io!(cursor.prev());
+                        }
+                        GeneralCursor::Ephemeral(cursor) => {
+                            cursor.set_null_flag(false);
+                            return_if_io!(cursor.prev());
+                        }
+                    }
+
                     state.pc += 1;
                 }
                 Insn::PrevAwait {
@@ -992,13 +1061,24 @@ impl Program {
                     pc_if_next,
                 } => {
                     assert!(pc_if_next.is_offset());
-                    let cursor =
-                        must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "PrevAwait");
-                    cursor.wait_for_completion()?;
-                    if !cursor.is_empty() {
-                        state.pc = pc_if_next.to_offset_int();
-                    } else {
-                        state.pc += 1;
+
+                    match must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "PrevAwait") {
+                        GeneralCursor::BTree(cursor) => {
+                            cursor.wait_for_completion()?;
+                            if !cursor.is_empty() {
+                                state.pc = pc_if_next.to_offset_int();
+                            } else {
+                                state.pc += 1;
+                            }
+                        }
+                        GeneralCursor::Ephemeral(cursor) => {
+                            cursor.wait_for_completion()?;
+                            if !cursor.is_empty() {
+                                state.pc = pc_if_next.to_offset_int();
+                            } else {
+                                state.pc += 1;
+                            }
+                        }
                     }
                 }
                 Insn::NextAwait {
@@ -1006,13 +1086,24 @@ impl Program {
                     pc_if_next,
                 } => {
                     assert!(pc_if_next.is_offset());
-                    let cursor =
-                        must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "NextAwait");
-                    cursor.wait_for_completion()?;
-                    if !cursor.is_empty() {
-                        state.pc = pc_if_next.to_offset_int();
-                    } else {
-                        state.pc += 1;
+
+                    match must_be_btree_cursor!(*cursor_id, self.cursor_ref, cursors, "NextAwait") {
+                        GeneralCursor::BTree(cursor) => {
+                            cursor.wait_for_completion()?;
+                            if !cursor.is_empty() {
+                                state.pc = pc_if_next.to_offset_int();
+                            } else {
+                                state.pc += 1;
+                            }
+                        }
+                        GeneralCursor::Ephemeral(cursor) => {
+                            cursor.wait_for_completion()?;
+                            if !cursor.is_empty() {
+                                state.pc = pc_if_next.to_offset_int();
+                            } else {
+                                state.pc += 1;
+                            }
+                        }
                     }
                 }
                 Insn::Halt {
@@ -2330,16 +2421,24 @@ impl Program {
                     cursor,
                     rowid_reg,
                     target_pc,
-                } => {
-                    let cursor =
-                        must_be_btree_cursor!(*cursor, self.cursor_ref, cursors, "NotExists");
-                    let exists = return_if_io!(cursor.exists(&state.registers[*rowid_reg]));
-                    if exists {
-                        state.pc += 1;
-                    } else {
-                        state.pc = target_pc.to_offset_int();
+                } => match must_be_btree_cursor!(*cursor, self.cursor_ref, cursors, "NotExists") {
+                    GeneralCursor::BTree(cursor) => {
+                        let exists = return_if_io!(cursor.exists(&state.registers[*rowid_reg]));
+                        if exists {
+                            state.pc += 1;
+                        } else {
+                            state.pc = target_pc.to_offset_int();
+                        }
                     }
-                }
+                    GeneralCursor::Ephemeral(cursor) => {
+                        let exists = return_if_io!(cursor.exists(&state.registers[*rowid_reg]));
+                        if exists {
+                            state.pc += 1;
+                        } else {
+                            state.pc = target_pc.to_offset_int();
+                        }
+                    }
+                },
                 Insn::OffsetLimit {
                     limit_reg,
                     combined_reg,

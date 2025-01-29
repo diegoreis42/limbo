@@ -1,5 +1,6 @@
 use limbo_ext::{AggCtx, FinalizeFunction, StepFunction};
 
+use crate::ephemeral::EphemeralCursor;
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
 use crate::pseudo::PseudoCursor;
@@ -616,6 +617,7 @@ pub enum Cursor {
     Table(BTreeCursor),
     Index(BTreeCursor),
     Pseudo(PseudoCursor),
+    Ephemeral(EphemeralCursor),
     Sorter(Sorter),
 }
 
@@ -634,6 +636,10 @@ impl Cursor {
 
     pub fn new_sorter(cursor: Sorter) -> Self {
         Self::Sorter(cursor)
+    }
+
+    pub fn new_ephemeral(cursor: EphemeralCursor) -> Self {
+        Self::Ephemeral(cursor)
     }
 
     pub fn as_table_mut(&mut self) -> &mut BTreeCursor {
@@ -663,8 +669,16 @@ impl Cursor {
             _ => panic!("Cursor is not a sorter cursor"),
         }
     }
+
+    pub fn as_ephemeral_mut(&mut self) -> &mut EphemeralCursor {
+        match self {
+            Self::Ephemeral(cursor) => cursor,
+            _ => panic!("Cursor is not ephemeral"),
+        }
+    }
 }
 
+#[derive(PartialEq, Debug)]
 pub enum CursorResult<T> {
     Ok(T),
     IO,

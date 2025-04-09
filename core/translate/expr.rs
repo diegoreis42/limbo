@@ -359,7 +359,7 @@ pub fn translate_condition_expr(
                     let rhs_reg = program.alloc_register();
                     let last_condition = i == rhs.len() - 1;
                     let _ =
-                        translate_expr(program, Some(referenced_tables), expr, rhs_reg, resolver)?;
+                        translate_and_mark(program, Some(referenced_tables), expr, rhs_reg, resolver)?;
                     // If this is not the last condition, we need to jump to the 'jump_target_when_true' label if the condition is true.
                     if !last_condition {
                         program.emit_insn(Insn::Eq {
@@ -390,7 +390,7 @@ pub fn translate_condition_expr(
                 for expr in rhs.iter() {
                     let rhs_reg = program.alloc_register();
                     let _ =
-                        translate_expr(program, Some(referenced_tables), expr, rhs_reg, resolver)?;
+                        translate_and_mark(program, Some(referenced_tables), expr, rhs_reg, resolver)?;
                     program.emit_insn(Insn::Eq {
                         lhs: lhs_reg,
                         rhs: rhs_reg,

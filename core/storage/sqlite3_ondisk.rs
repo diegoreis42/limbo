@@ -251,6 +251,7 @@ pub fn begin_read_database_header(
     let buf = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
     let result = Arc::new(SpinLock::new(DatabaseHeader::default()));
     let header = result.clone();
+    tracing::debug!("begin_read_database_header(header={:?})", DatabaseHeader::default());
     let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
         let header = header.clone();
         finish_read_database_header(buf, header).unwrap();

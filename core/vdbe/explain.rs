@@ -2,7 +2,7 @@ use crate::vdbe::{builder::CursorType, insn::RegisterOrLiteral};
 
 use super::{Insn, InsnReference, OwnedValue, Program};
 use crate::function::{Func, ScalarFunc};
-use std::rc::Rc;
+use std::{num, rc::Rc};
 
 pub fn insn_to_str(
     program: &Program,
@@ -1433,6 +1433,41 @@ pub fn insn_to_str(
                 dest_end.map_or(format!("r[{}]=NULL", dest), |end| {
                     format!("r[{}..{}]=NULL", dest, end)
                 }),
+            ),
+            Insn::NotFound {
+                cursor_id,
+                target_pc,
+                record_reg,
+                num_regs,
+            } => (
+                "NotFound",
+                *cursor_id as i32,
+                target_pc.to_debug_int(),
+                *record_reg as i32,
+                OwnedValue::build_text(""),
+                *num_regs as u16,
+                format!(
+                    "if (r[{}] != {}) goto {}",
+                    record_reg,
+                    &program.cursor_ref[*cursor_id]
+                        .0
+                        .as_ref()
+                        .unwrap_or(&format!("cursor {}", cursor_id)),
+                    target_pc.to_debug_int()
+                ),
+            ),
+            Insn::Affinity {
+                start_reg,
+                count,
+                affinities,
+            } => (
+                "Affinity",
+                *start_reg as i32,
+                *count as i32,
+                0,
+                OwnedValue::build_text(affinities),
+                0,
+                format!("affinity(r[{}])", start_reg),
             ),
         };
     format!(

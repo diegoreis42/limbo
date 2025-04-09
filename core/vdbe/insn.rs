@@ -819,6 +819,17 @@ pub enum Insn {
         cursor_id: usize,
         is_btree: bool,
     },
+    NotFound {
+        cursor_id: CursorID,
+        target_pc: BranchOffset,
+        record_reg: usize,
+        num_regs: usize,
+    },
+    Affinity {
+        start_reg: usize,
+        count: usize,
+        affinities: String,
+    },
 }
 
 impl Insn {
@@ -939,6 +950,8 @@ impl Insn {
             Insn::PageCount { .. } => execute::op_page_count,
             Insn::ReadCookie { .. } => execute::op_read_cookie,
             Insn::OpenEphemeral { .. } => execute::op_open_ephemeral,
+            Insn::NotFound { .. } => execute::op_not_found,
+            Insn::Affinity { .. } => execute::op_affinity,
         }
     }
 }

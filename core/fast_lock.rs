@@ -11,7 +11,7 @@ pub struct SpinLock<T> {
 }
 
 pub struct SpinLockGuard<'a, T> {
-    lock: &'a SpinLock<T>,
+    pub lock: &'a SpinLock<T>,
 }
 
 impl<'a, T> Drop for SpinLockGuard<'a, T> {

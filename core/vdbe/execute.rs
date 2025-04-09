@@ -1,4 +1,6 @@
 #![allow(unused_variables)]
+use crate::storage::database::FileMemoryStorage;
+use crate::storage::page_cache::DumbLruPageCache;
 use crate::{
     error::{LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_PRIMARYKEY},
     ext::ExtValue,
@@ -10,9 +12,6 @@ use crate::{
         printf::exec_printf,
     },
 };
-use crate::functions::printf::exec_printf;
-use crate::storage::database::FileMemoryStorage;
-use crate::storage::page_cache::DumbLruPageCache;
 use std::sync::Arc;
 use std::{borrow::BorrowMut, rc::Rc};
 
@@ -41,14 +40,14 @@ use crate::{
 };
 
 use crate::{
-    info, BufferPool, MvCursor, OpenFlags, RefValue, Row, StepResult, TransactionState, IO,
+    info, maybe_init_database_file, BufferPool, MvCursor, OpenFlags, RefValue, Row, StepResult,
+    TransactionState, IO,
 };
 
 use super::{
     insn::{Cookie, RegisterOrLiteral},
     HaltState,
 };
-use super::HaltState;
 use parking_lot::RwLock;
 use rand::thread_rng;
 
@@ -1447,6 +1446,7 @@ pub fn op_make_record(
         unreachable!("unexpected Insn {:?}", insn)
     };
     let record = make_record(&state.registers, start_reg, count);
+    tracing::trace!("make_record: {:?}", record);
     state.registers[*dest_reg] = Register::Record(record);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -4513,22 +4513,25 @@ pub fn op_open_ephemeral(
     let io = conn.pager.io.get_memory_io();
 
     let file = io.open_file("", OpenFlags::Create, true)?;
-    let page_io = Arc::new(FileMemoryStorage::new(file));
+    maybe_init_database_file(&file, &(io.clone() as Arc<dyn IO>))?;
+    let db_file = Arc::new(FileMemoryStorage::new(file));
 
-    let db_header = Pager::begin_open(page_io.clone())?;
-    let buffer_pool = Rc::new(BufferPool::new(512));
+    let db_header = Pager::begin_open(db_file.clone())?;
+    let buffer_pool = Rc::new(BufferPool::new(db_header.lock().page_size as usize)); // TODO: fix it
     let page_cache = Arc::new(RwLock::new(DumbLruPageCache::new(10)));
 
     let pager = Rc::new(Pager::finish_open(
         db_header,
-        page_io,
+        db_file,
         None,
         io,
         page_cache,
         buffer_pool,
     )?);
 
-    let root_page = pager.btree_create(*is_btree as usize);
+    let flag = if *is_btree { 1 } else { 2 };
+
+    let root_page = pager.btree_create(flag);
 
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
     let mv_cursor = match state.mv_tx_id {
@@ -4542,7 +4545,8 @@ pub fn op_open_ephemeral(
         }
         None => None,
     };
-    let cursor = BTreeCursor::new(mv_cursor, pager, root_page as usize);
+    let mut cursor = BTreeCursor::new(mv_cursor, pager.clone(), root_page as usize);
+    cursor.rewind()?;
     let mut cursors: std::cell::RefMut<'_, Vec<Option<Cursor>>> = state.cursors.borrow_mut();
     // Table content is erased if the cursor already exists
     match cursor_type {
@@ -4567,6 +4571,87 @@ pub fn op_open_ephemeral(
         CursorType::VirtualTable(_) => {
             panic!("OpenEphemeral on virtual table cursor, use Insn::VOpenAsync instead");
         }
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_not_found(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Rc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    let Insn::NotFound {
+        cursor_id,
+        target_pc,
+        record_reg,
+        num_regs,
+    } = insn
+    else {
+        unreachable!("unexpected Insn {:?}", insn)
+    };
+
+    assert!(target_pc.is_offset());
+
+    let found = {
+        let mut cursor = state.get_cursor(*cursor_id);
+        let cursor = cursor.as_btree_mut();
+
+        if *num_regs == 0 {
+            // P4 == 0, register P3 holds a blob constructed by MakeRecord
+            let record = match &state.registers[*record_reg] {
+                Register::Record(r) => r,
+                _ => {
+                    return Err(LimboError::InternalError(
+                        "NotFound: expected a record in the register".to_string(),
+                    ));
+                }
+            };
+            cursor.seek(SeekKey::IndexKey(&record), SeekOp::EQ)?
+        } else {
+            // P4 > 0, registers P3 to P3+P4-1 form an unpacked record
+            let record = make_record(&state.registers, record_reg, num_regs);
+            cursor.seek(SeekKey::IndexKey(&record), SeekOp::EQ)?
+        }
+    };
+
+    // handle IO properly
+    if let CursorResult::Ok(found) = found {
+        if !found {
+            state.pc = target_pc.to_offset_int();
+        } else {
+            state.pc += 1;
+        }
+    }
+
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_affinity(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Rc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    let Insn::Affinity {
+        start_reg,
+        count,
+        affinities,
+    } = insn
+    else {
+        unreachable!("unexpected Insn {:?}", insn)
+    };
+
+    for (i, affinity_char) in affinities.chars().enumerate().take(*count) {
+        let reg_index = *start_reg + i;
+        let affinity = Affinity::from_char(affinity_char).ok_or_else(|| {
+            LimboError::InternalError(format!("Invalid affinity: {}", affinity_char))
+        })?;
+        apply_affinity_char(&mut state.registers[reg_index], affinity);
     }
 
     state.pc += 1;

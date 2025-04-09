@@ -79,10 +79,7 @@ unsafe impl Sync for FileMemoryStorage {}
 
 impl DatabaseStorage for FileMemoryStorage {
     fn read_page(&self, page_idx: usize, c: Completion) -> Result<()> {
-        let r = match c {
-            Completion::Read(ref r) => r,
-            _ => unreachable!(),
-        };
+        let r = c.as_read();
         let size = r.buf().len();
         assert!(page_idx > 0);
         if !(512..=65536).contains(&size) || size & (size - 1) != 0 {
@@ -100,6 +97,7 @@ impl DatabaseStorage for FileMemoryStorage {
         c: Completion,
     ) -> Result<()> {
         let buffer_size = buffer.borrow().len();
+        assert!(page_idx > 0);
         assert!(buffer_size >= 512);
         assert!(buffer_size <= 65536);
         assert_eq!(buffer_size & (buffer_size - 1), 0);

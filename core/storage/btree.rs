@@ -383,6 +383,7 @@ impl BTreeCursor {
         pager: Rc<Pager>,
         root_page: usize,
     ) -> Self {
+        tracing::debug!("creating new btree cursor");
         Self {
             mv_cursor,
             pager,
@@ -1455,7 +1456,7 @@ impl BTreeCursor {
         let record = bkey
             .get_record()
             .expect("expected record present on insert");
-
+        tracing::trace!("insert_into_page(record={:?})", record);
         if let CursorState::None = &self.state {
             self.state = CursorState::Write(WriteInfo::new());
         }
@@ -1489,7 +1490,10 @@ impl BTreeCursor {
                         (self.find_cell(page, bkey), page.page_type())
                     };
                     tracing::debug!("insert_into_page(cell_idx={})", cell_idx);
-
+                    tracing::debug!(
+                        "insert_into_page(page.get_contents().cell_count()={})",
+                        page.get_contents().cell_count()
+                    );
                     // if the cell index is less than the total cells, check: if its an existing
                     // rowid, we are going to update / overwrite the cell
                     if cell_idx < page.get_contents().cell_count() {
@@ -3944,10 +3948,33 @@ fn validate_cells_after_insertion(cell_array: &CellArray, leaf_data: bool) {
 
 impl PageStack {
     fn increment_current(&self) {
+        tracing::trace!(
+            "pagestack::increment_current, current value={}",
+            self.current_page.get()
+        );
         self.current_page.set(self.current_page.get() + 1);
     }
     fn decrement_current(&self) {
-        self.current_page.set(self.current_page.get() - 1);
+        let current = self.current_page.get();
+        tracing::trace!(
+            "pagestack::decrement_current, current value={}",
+            self.current_page.get()
+        );
+
+        if current <= 0 {
+            // Log an error and capture a backtrace
+            tracing::error!(
+            "INVALID OPERATION: Attempting to decrement current_page below 0: {}.\nBacktrace: {:?}",
+            current,
+            std::backtrace::Backtrace::force_capture()
+        );
+            // Option 1: Keep at 0 (fail-safe)
+            self.current_page.set(0);
+            // Option 2: Panic to immediately catch in development
+            // panic!("Attempted to decrement current_page below 0");
+        } else {
+            self.current_page.set(current - 1);
+        }
     }
     /// Push a new page onto the stack.
     /// This effectively means traversing to a child page.
@@ -3980,6 +4007,16 @@ impl PageStack {
     fn pop(&self) {
         let current = self.current_page.get();
         tracing::trace!("pagestack::pop(current={})", current);
+
+        if current <= 0 {
+            tracing::error!(
+            "INVALID OPERATION: Attempting to pop from empty stack. Current: {}.\nBacktrace: {:?}",
+            current,
+            std::backtrace::Backtrace::force_capture()
+        );
+            return; // Early return to prevent underflow
+        }
+
         self.cell_indices.borrow_mut()[current as usize] = 0;
         self.stack.borrow_mut()[current as usize] = None;
         self.decrement_current();
@@ -3988,6 +4025,7 @@ impl PageStack {
     /// Get the top page on the stack.
     /// This is the page that is currently being traversed.
     fn top(&self) -> PageRef {
+        tracing::trace!("pagestack::top(current={})", self.current());
         let page = self.stack.borrow()[self.current()]
             .as_ref()
             .unwrap()
@@ -4002,7 +4040,22 @@ impl PageStack {
 
     /// Current page pointer being used
     fn current(&self) -> usize {
-        self.current_page.get() as usize
+        let value = self.current_page.get();
+        if value < 0 {
+            tracing::error!(
+            "INVALID STATE: Attempting to convert negative current_page {} to usize.\nBacktrace: {:?}",
+            value,
+            std::backtrace::Backtrace::force_capture()
+            );
+            assert!(
+            value >= 0,
+            "INVALID STATE: Attempting to convert negative current_page {} to usize",
+            value
+            );
+        }
+
+        tracing::trace!("pagestack::current i32 {}, usize {}", value, value as usize);
+        value as usize
     }
 
     /// Cell index of the current page
@@ -4028,7 +4081,7 @@ impl PageStack {
 
     fn retreat(&self) {
         let current = self.current();
-        tracing::trace!("retreat {}", self.cell_indices.borrow()[current]);
+        tracing::trace!("pagestack::retreat {}", self.cell_indices.borrow()[current]);
         self.cell_indices.borrow_mut()[current] -= 1;
     }
 
@@ -4054,7 +4107,19 @@ impl PageStack {
     }
 
     fn clear(&self) {
+        tracing::trace!("pagestack::clear(current={})", self.current_page.get());
         self.current_page.set(-1);
+    }
+}
+
+impl Drop for PageStack {
+    fn drop(&mut self) {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        tracing::debug!(
+            "PageStack dropped with final current_page = {} at:\n{:?}",
+            self.current_page.get(),
+            backtrace
+        );
     }
 }
 
@@ -4789,6 +4854,11 @@ fn allocate_overflow_page(pager: Rc<Pager>) -> PageRef {
 /// - Ensure enough payload is on the b-tree page that the record header can usually be accessed
 ///   without consulting an overflow page
 fn payload_overflow_threshold_max(page_type: PageType, usable_space: u16) -> usize {
+    tracing::trace!(
+        "payload_overflow_threshold_max(page_type={:?}, usable_space={})",
+        page_type,
+        usable_space
+    );
     match page_type {
         PageType::IndexInterior | PageType::IndexLeaf => {
             ((usable_space as usize - 12) * 64 / 255) - 23 // Index page formula
